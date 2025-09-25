@@ -6,14 +6,14 @@ from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.utils import ImageReader
 
-# Try to import pdf2image
+# Optional: PDF -> Image
 try:
     from pdf2image import convert_from_bytes
     PDF2IMAGE_OK = True
 except Exception:
     PDF2IMAGE_OK = False
 
-# On macOS with Homebrew, poppler installs to this path
+# macOS Homebrew poppler path (adjust if different)
 POPPLER_PATH = "/opt/homebrew/opt/poppler/bin"
 
 st.set_page_config(page_title="Exact Size File Converter", layout="centered")
@@ -31,9 +31,8 @@ TARGET_MAX_QUALITY = 95
 
 # ----------------- helpers -----------------
 def pad_file_to_size_safe(data: bytes, target_bytes: int, is_pdf=False) -> bytes:
-    """Pad data to reach target size. For PDFs, never truncate."""
+    """Pad data to reach target size. Never truncate PDFs."""
     if len(data) >= target_bytes:
-        # Images can be truncated safely, but PDFs cannot
         return data if is_pdf else data[:target_bytes]
     return data + b" " * (target_bytes - len(data))
 
@@ -75,7 +74,7 @@ def image_to_image_exact(data: bytes, out_fmt: str, target_bytes: int) -> bytes:
     if len(out_bytes) <= target_bytes:
         return pad_file_to_size_safe(out_bytes, target_bytes)
 
-    # 2) Try quality binary search for JPEG/WEBP
+    # 2) Quality binary search (JPEG/WEBP)
     if pil_format in ("JPEG", "WEBP"):
         low, high = TARGET_MIN_QUALITY, TARGET_MAX_QUALITY
         best = None
@@ -91,7 +90,7 @@ def image_to_image_exact(data: bytes, out_fmt: str, target_bytes: int) -> bytes:
         if best:
             return pad_file_to_size_safe(best, target_bytes)
 
-    # 3) Progressive resize fallback
+    # 3) Progressive resize
     w, h = img.size
     while w > 50 and h > 50:
         w = max(int(w * 0.9), 50)
@@ -101,31 +100,77 @@ def image_to_image_exact(data: bytes, out_fmt: str, target_bytes: int) -> bytes:
         if len(candidate) <= target_bytes:
             return pad_file_to_size_safe(candidate, target_bytes)
 
+    # Best-effort
     return pad_file_to_size_safe(out_bytes, target_bytes)
 
-def image_to_pdf(data: bytes, target_bytes: int) -> bytes:
-    """Embed image bytes as a single-page PDF safely."""
-    img = Image.open(io.BytesIO(data))
-    buf = io.BytesIO()
-    c = canvas.Canvas(buf, pagesize=A4)
-    iw, ih = img.size
+def _build_pdf_from_image_bytes(img_bytes: bytes, iw: int, ih: int, scale: float) -> bytes:
+    """
+    Place an image (already encoded) onto an A4 canvas at a given scale.
+    Returns PDF bytes.
+    """
     pw, ph = A4
-
-    scale = min((pw - 40) / iw, (ph - 40) / ih, 1.0)
     draw_w = iw * scale
     draw_h = ih * scale
     x = (pw - draw_w) / 2
     y = (ph - draw_h) / 2
 
-    image_reader = ImageReader(io.BytesIO(data))
-    c.drawImage(image_reader, x, y, width=draw_w, height=draw_h,
-                preserveAspectRatio=True, mask="auto")
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=A4)
+    reader = ImageReader(io.BytesIO(img_bytes))
+    c.drawImage(reader, x, y, width=draw_w, height=draw_h, preserveAspectRatio=True, mask="auto")
     c.showPage()
     c.save()
-    pdf_bytes = buf.getvalue()
+    return buf.getvalue()
 
-    # ✅ Only pad PDFs, never truncate
-    return pad_file_to_size_safe(pdf_bytes, target_bytes, is_pdf=True)
+def image_to_pdf_exact(data: bytes, target_bytes: int) -> bytes:
+    """
+    Create a single-page PDF from an image with **shrinking**:
+    - Try binary-search JPEG quality for the embedded image
+    - If still too large, downscale the image and try again
+    - Never truncate PDFs; pad to exact if under target
+    """
+    # Load original image for dimensions
+    pil_img = Image.open(io.BytesIO(data))
+    orig_w, orig_h = pil_img.size
+
+    # We’ll embed a JPEG version of the image into the PDF (good balance)
+    # Try scales from 1.0 down to ~0.3
+    for scale in [1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.45, 0.4, 0.35, 0.3]:
+        # Resize for this scale (affects PDF size strongly)
+        w = max(int(orig_w * scale), 1)
+        h = max(int(orig_h * scale), 1)
+        scaled_img = pil_img.resize((w, h), Image.LANCZOS)
+
+        # Binary search JPEG quality for the embedded image
+        low, high = 30, 95   # keep above 30 for acceptable visual quality
+        best_pdf = None
+
+        while low <= high:
+            mid = (low + high) // 2
+            # encode JPEG at this quality
+            jpg_bytes = save_with_format(scaled_img, "JPEG", quality=mid)
+            # make a PDF placing that JPEG at the same pixel scale
+            pdf_bytes = _build_pdf_from_image_bytes(jpg_bytes, w, h, scale=1.0)  # image already scaled
+            size = len(pdf_bytes)
+            if size <= target_bytes:
+                best_pdf = pdf_bytes
+                low = mid + 1
+            else:
+                high = mid - 1
+
+        if best_pdf:
+            # We got under target at this scale; pad to exact and return
+            return pad_file_to_size_safe(best_pdf, target_bytes, is_pdf=True)
+
+    # If we couldn’t get ≤ target even at smallest scale/quality, generate the smallest and pad
+    # Make a very small, decent-quality fallback
+    fallback = pil_img.resize((max(orig_w // 3, 1), max(orig_h // 3, 1)), Image.LANCZOS)
+    jpg_bytes = save_with_format(fallback, "JPEG", quality=60)
+    pdf_bytes = _build_pdf_from_image_bytes(jpg_bytes, fallback.width, fallback.height, scale=1.0)
+    # If still larger, we must return as-is (never truncate). Otherwise pad.
+    if len(pdf_bytes) < target_bytes:
+        return pad_file_to_size_safe(pdf_bytes, target_bytes, is_pdf=True)
+    return pdf_bytes  # larger but valid
 
 def pdf_to_pdf_exact(data: bytes, target_bytes: int) -> bytes:
     """Pad PDF safely (never truncate)."""
@@ -133,9 +178,7 @@ def pdf_to_pdf_exact(data: bytes, target_bytes: int) -> bytes:
 
 def pdf_to_image(data: bytes, out_fmt: str, target_bytes: int) -> bytes:
     if not PDF2IMAGE_OK:
-        raise RuntimeError(
-            "pdf2image not installed. Run: pip install pdf2image"
-        )
+        raise RuntimeError("pdf2image not installed. Run: pip install pdf2image")
     pages = convert_from_bytes(
         data, dpi=200, first_page=1, last_page=1,
         poppler_path=POPPLER_PATH
@@ -161,15 +204,15 @@ if run and uploaded:
 
         if in_mime.startswith("image") or ext_in in (".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff", ".tif"):
             if out_type == "pdf":
-                st.info("Converting Image → PDF")
-                out_data = image_to_pdf(data, target_bytes)
+                st.info("Converting Image → PDF (shrinking to target)")
+                out_data = image_to_pdf_exact(data, target_bytes)
             else:
                 st.info(f"Converting Image → {out_type.upper()}")
                 out_data = image_to_image_exact(data, out_type, target_bytes)
 
         elif in_mime == "application/pdf" or ext_in == ".pdf":
             if out_type == "pdf":
-                st.info("Converting PDF → PDF")
+                st.info("Converting PDF → PDF (pad only; no truncation)")
                 out_data = pdf_to_pdf_exact(data, target_bytes)
             else:
                 st.info("Converting PDF → Image")
@@ -184,4 +227,3 @@ if run and uploaded:
 
     except Exception as e:
         st.error(f"Error: {e}")
-
