@@ -1,0 +1,4 @@
+streamlit
+pillow
+reportlab
+pdf2image
